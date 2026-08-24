@@ -11,7 +11,7 @@
   :in-order-to ((test-op (test-op "rpc-backend-stdio/tests"))))
 
 (defsystem "rpc-backend-stdio/tests"
-  :depends-on ("rpc-backend-stdio" "rove")
+  :depends-on ("rpc-backend-stdio" "process-backend-uiop" "rove" "bordeaux-threads")
   :pathname "tests"
   :serial t
   :components ((:file "package")
