@@ -75,3 +75,24 @@
           (ignore-errors (close client-in))
           (ignore-errors (close server-in))
           (ignore-errors (close server-out)))))))
+
+(deftest notifications-from-other-threads-keep-lines-whole
+  (let* ((n 40)
+         (in (make-string-input-stream
+              (format nil "~{~a~%~}"
+                      (loop for i from 1 to n
+                            collect (rpc-protocol:encode-request "echo" (make-string 200 :initial-element #\x) :id i)))))
+         (out (make-string-output-stream))
+         (tx (rpc-backend-stdio:make-stdio-rpc-transport :input in :output out))
+         (threads (loop repeat 4
+                        collect (bt2:make-thread
+                                 (lambda ()
+                                   (loop repeat 50
+                                         do (rpc-protocol:rpc-notify "tick" (make-string 200 :initial-element #\y)
+                                                                     :transport tx)))))))
+    (rpc-protocol:rpc-serve #'%echo :transport tx)
+    (mapc #'bt2:join-thread threads)
+    (let ((lines (with-input-from-string (s (get-output-stream-string out))
+                   (loop for line = (read-line s nil) while line collect line))))
+      (ok (= (+ n 200) (length lines)))
+      (ok (every (lambda (line) (hash-table-p (rpc-protocol:decode-message line))) lines)))))

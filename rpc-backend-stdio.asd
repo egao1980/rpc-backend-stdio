@@ -1,9 +1,9 @@
 (defsystem "rpc-backend-stdio"
-  :version "0.1.1"
+  :version "0.1.2"
   :description "stdio (newline JSON-RPC) transport for rpc-protocol"
   :author "egao1980"
   :license "MIT"
-  :depends-on ("rpc-protocol" "rpc-protocol-json" "process-protocol")
+  :depends-on ("rpc-protocol" "rpc-protocol-json" "process-protocol" "bordeaux-threads")
   :properties (:cl-repo (:ci (:with ("dissect"))))
   :serial t
   :pathname "src"

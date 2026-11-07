@@ -5,7 +5,10 @@
    (output :initarg :output :initform nil :accessor transport-output)
    (command :initarg :command :initform nil :accessor transport-command)
    (process :initform nil :accessor transport-process)
-   (next-id :initform 0 :accessor transport-next-id)))
+   (next-id :initform 0 :accessor transport-next-id)
+   (write-lock :initform (bt2:make-lock :name "stdio-rpc write") :reader transport-write-lock
+               :documentation "Held for each line written, so a notification sent from
+another thread never interleaves with a response.")))
 
 (defun make-stdio-rpc-transport (&key input output command)
   (make-instance 'stdio-rpc-transport
@@ -37,10 +40,14 @@
   (values (or (transport-input transport) *standard-input*)
           (or (transport-output transport) *standard-output*)))
 
-(defun %write-json-line (stream string)
-  (write-string string stream)
-  (write-char #\newline stream)
-  (finish-output stream))
+(defun %write-json-line (stream string &optional transport)
+  (flet ((emit ()
+           (write-string string stream)
+           (write-char #\newline stream)
+           (finish-output stream)))
+    (if transport
+        (bt2:with-lock-held ((transport-write-lock transport)) (emit))
+        (emit))))
 
 (defun %read-json-line (stream)
   (let ((line (read-line stream nil :eof)))
@@ -88,14 +95,14 @@
   (declare (ignore timeout))
   (multiple-value-bind (in out) (%ensure-io transport)
     (let ((id (or id (incf (transport-next-id transport)))))
-      (%write-json-line out (rpc-protocol:encode-request method params :id id))
+      (%write-json-line out (rpc-protocol:encode-request method params :id id) transport)
       (%raise-rpc (rpc-protocol:decode-message (%read-json-line in))))))
 
 (defmethod rpc-protocol:backend-rpc-notify
     ((transport stdio-rpc-transport) method params)
   (multiple-value-bind (in out) (%ensure-io transport)
     (declare (ignore in))
-    (%write-json-line out (rpc-protocol:encode-notification method params))
+    (%write-json-line out (rpc-protocol:encode-notification method params) transport)
     t))
 
 (defmethod rpc-protocol:backend-rpc-serve
@@ -105,7 +112,7 @@
           until (eq line :eof)
           do (let ((wire (%handle-message handler (rpc-protocol:decode-message line))))
                (when wire
-                 (%write-json-line out wire)))))
+                 (%write-json-line out wire transport)))))
   transport)
 
 (use-stdio-rpc-transport)
