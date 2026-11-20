@@ -13,9 +13,3 @@
            #:stdio-rpc-timeout-seconds
            #:make-stdio-pipe
            #:make-stdio-rpc-pair))
-
-(in-package #:rpc-backend-stdio)
-
-(defun %not-implemented (name)
-  "0.2.0 contract stub."
-  (error "~a is not implemented (rpc-backend-stdio 0.2.0 contract stub)" name))
