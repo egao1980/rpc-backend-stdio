@@ -72,9 +72,14 @@
           (ignore-errors (close client-out))
           (when thread
             (bt:join-thread thread))
-          (ignore-errors (close client-in))
+          ;; 0.2.0: the client's reader thread is blocked reading CLIENT-IN.
+          ;; Close the server's end first so the reader sees EOF and exits; on
+          ;; Windows, closing a pipe under a pending read blocks
+          ;; (rpc-backend-stdio#10).
+          (ignore-errors (close server-out))
           (ignore-errors (close server-in))
-          (ignore-errors (close server-out)))))))
+          (sleep 0.2)
+          (ignore-errors (close client-in)))))))
 
 (deftest notifications-from-other-threads-keep-lines-whole
   (let* ((n 40)
