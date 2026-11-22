@@ -79,6 +79,43 @@
 ;;; to TIMEOUT seconds for it to exit, then kill it (FORCE: at once, without
 ;;; the wait). The reader thread is stopped and joined. Calls still waiting
 ;;; get the "peer closed" RPC-ERROR. Idempotent. → TRANSPORT.
+;;;
+;;; 0.3.0: request dispatch (client mode). MAKE-STDIO-RPC-TRANSPORT
+;;; :DISPATCH picks the thread that runs ON-REQUEST and ON-NOTIFICATION:
+;;;   :READER (default, 0.2.0) → on the reader thread, as above. A handler
+;;;                that calls RPC-CALL on the same transport would wait for
+;;;                a response only the reader can read, so that call signals
+;;;                RPC-ERROR -32603 at once instead of deadlocking.
+;;;   :SERIAL     → one dispatcher thread runs every incoming request and
+;;;                notification, one at a time, in arrival order. The reader
+;;;                only routes, so a handler may RPC-CALL the peer and wait
+;;;                (ACP: session/prompt → session/request_permission). A
+;;;                request that arrives while a handler waits is queued
+;;;                behind it.
+;;;   :CONCURRENT → each request runs on a thread of its own, at once;
+;;;                notifications run on one dispatcher thread, in arrival
+;;;                order (session/update stays ordered, and a session/cancel
+;;;                notification is seen while session/prompt still runs).
+;;; Guarantees in every mode: notifications are handled in arrival order,
+;;; one at a time; responses are routed to their calls by the reader as
+;;; they arrive, whatever the handlers do; each answer is written whole
+;;; under the write lock when its handler returns (under :CONCURRENT answers
+;;; may go out in any order — JSON-RPC matches them by id). The 0.2.0 answer
+;;; table holds: a handler's RPC-ERROR → its code, message and data, any
+;;; other ERROR → -32603, no ON-REQUEST → -32601; notification handler
+;;; errors are dropped.
+;;; *STDIO-RPC-REQUEST-ID* is bound to the request's id while ON-REQUEST (or
+;;; a server HANDLER) runs, NIL for a notification, so a layer above can map
+;;; a cancel notification to the running handler.
+;;; Shutdown: CLOSE-STDIO-RPC-TRANSPORT drops queued messages that have not
+;;; started, makes every RPC-CALL a handler waits in signal "peer closed",
+;;; and joins the dispatcher and the workers; one still running after 2 s is
+;;; interrupted and unwound. At the peer's EOF the messages already read are
+;;; still handled (their answers are dropped when the peer cannot read).
+;;; STDIO-RPC-TRANSPORT-WAIT-CLOSED TRANSPORT &key TIMEOUT: start the reader
+;;; if needed and block until the input reached EOF (or the transport was
+;;; closed) and no handler runs or waits in the queue. → T, or NIL when
+;;; TIMEOUT seconds passed first. An agent process's main thread waits here.
 
 (defclass stdio-rpc-transport (rpc-protocol:rpc-transport)
   ((input :initarg :input :initform nil :accessor transport-input)
@@ -111,7 +148,22 @@ another thread never interleaves with a response.")
              :documentation "Broadcast, under STATE-LOCK, whenever a pending cell is
 answered or CLOSED becomes true; RPC-CALL waits on it.")
    (closed-by-user :initform nil :accessor transport-closed-by-user
-                   :documentation "True once CLOSE-STDIO-RPC-TRANSPORT ran (idempotence).")))
+                   :documentation "True once CLOSE-STDIO-RPC-TRANSPORT ran (idempotence).")
+   ;; 0.3.0 (dispatch; QUEUE, DISPATCHER, WORKERS and ACTIVE under STATE-LOCK)
+   (dispatch :initarg :dispatch :initform :reader :reader stdio-rpc-transport-dispatch
+             :documentation ":READER, :SERIAL or :CONCURRENT (see the header).")
+   (queue :initform nil :accessor transport-queue
+          :documentation "Incoming (kind . message) pairs the dispatcher has not taken, oldest first.")
+   (queue-tail :initform nil :accessor transport-queue-tail)
+   (dispatcher :initform nil :accessor transport-dispatcher
+               :documentation "The dispatcher thread (:SERIAL, :CONCURRENT), or NIL.")
+   (workers :initform '() :accessor transport-workers
+            :documentation ":CONCURRENT: the request threads still running.")
+   (active :initform 0 :accessor transport-active
+           :documentation "Handlers running off the reader thread now.")))
+
+(defvar *stdio-rpc-request-id* nil
+  "The id of the request whose handler runs in this thread, NIL otherwise.")
 
 (defun stdio-rpc-transport-process (transport)
   "The launched child's process handle (:COMMAND), or NIL."
@@ -131,14 +183,16 @@ answered or CLOSED becomes true; RPC-CALL waits on it.")
       (stdio-rpc-transport-on-request transport)))
 
 (defun make-stdio-rpc-transport (&key input output command (error-output :interactive)
-                                      on-notification on-request)
+                                      on-notification on-request (dispatch :reader))
   "A transport on INPUT / OUTPUT (default *STANDARD-INPUT* / *STANDARD-OUTPUT*
 when used), or on the pipes of COMMAND launched on first use. ON-NOTIFICATION
-or ON-REQUEST make it a client whose reader thread starts at once (see the
-header)."
+or ON-REQUEST make it a client whose reader thread starts at once. DISPATCH
+(0.3.0): :READER, :SERIAL or :CONCURRENT, the thread the handlers run on
+(see the header)."
+  (check-type dispatch (member :reader :serial :concurrent))
   (let ((transport (make-instance 'stdio-rpc-transport
                                   :input input :output output :command command
-                                  :error-output error-output
+                                  :error-output error-output :dispatch dispatch
                                   :on-notification on-notification :on-request on-request)))
     ;; With :COMMAND the child is launched on first use, and the reader
     ;; starts right after the launch (%ENSURE-IO).
@@ -237,7 +291,8 @@ for a notification. RPC-ERROR → its code, message and data; any other ERROR
              (and has-id
                   (rpc-protocol:encode-error-response code text :id id :data data))))
       (handler-case
-          (let ((result (funcall handler (gethash "method" msg) (gethash "params" msg))))
+          (let ((result (let ((*stdio-rpc-request-id* (and has-id id)))
+                          (funcall handler (gethash "method" msg) (gethash "params" msg)))))
             (and has-id (rpc-protocol:encode-response result :id id)))
         (rpc-protocol:rpc-error (c)
           (fail (rpc-protocol:rpc-error-code c)
@@ -305,26 +360,107 @@ and every later call signals \"peer closed\"."
   (declare (ignore method params))
   (error 'rpc-protocol:rpc-method-not-found))
 
+(defun %handle-incoming (transport output kind msg)
+  "Run the handler for the incoming notification or request MSG (KIND), in
+the calling thread, and write a request's answer."
+  (ecase kind
+    (:notification
+     (let ((handler (stdio-rpc-transport-on-notification transport)))
+       (when handler
+         ;; The header: an error in the handler is dropped, reading goes on.
+         (handler-case (funcall handler (gethash "method" msg) (gethash "params" msg))
+           (error () nil)))))
+    (:request
+     (let ((wire (%answer (or (stdio-rpc-transport-on-request transport)
+                              #'%no-request-handler)
+                          msg)))
+       (when wire
+         ;; A peer that went away cannot be answered; the answer is dropped.
+         (handler-case (%write-json-line output wire transport)
+           (error () nil)))))))
+
+;;; 0.3.0: dispatch off the reader thread.
+
+(defun %enqueue (transport kind msg)
+  "Queue MSG for the dispatcher thread (under STATE-LOCK)."
+  (bt2:with-lock-held ((transport-state-lock transport))
+    (unless (transport-closed-by-user transport)
+      (let ((cell (list (cons kind msg))))
+        (if (transport-queue transport)
+            (setf (cdr (transport-queue-tail transport)) cell)
+            (setf (transport-queue transport) cell))
+        (setf (transport-queue-tail transport) cell))
+      (bt2:condition-broadcast (transport-state-cv transport)))))
+
+(defun %take (transport)
+  "Wait for the next queued (kind . message). → it, or NIL when the
+dispatcher stops: the transport was closed by the user (the queue is
+dropped), or the input reached EOF and the queue is empty. A taken item
+counts as ACTIVE until %DONE."
+  (let ((lock (transport-state-lock transport))
+        (cv (transport-state-cv transport)))
+    (bt2:with-lock-held (lock)
+      (loop
+        (cond ((transport-closed-by-user transport)
+               (setf (transport-queue transport) nil
+                     (transport-queue-tail transport) nil)
+               (return nil))
+              ((transport-queue transport)
+               (incf (transport-active transport))
+               (return (pop (transport-queue transport))))
+              ((transport-closed transport) (return nil)))
+        (bt2:condition-wait cv lock)))))
+
+(defun %done (transport &optional thread)
+  "A handler off the reader thread finished (THREAD: a request worker)."
+  (bt2:with-lock-held ((transport-state-lock transport))
+    (decf (transport-active transport))
+    (when thread
+      (setf (transport-workers transport) (delete thread (transport-workers transport))))
+    (bt2:condition-broadcast (transport-state-cv transport))))
+
+(defun %dispatcher-loop (transport output)
+  (catch '%stop-worker                  ; CLOSE-STDIO-RPC-TRANSPORT's last resort
+    (loop for item = (%take transport)
+          while item
+          do (unwind-protect
+                  (handler-case (%handle-incoming transport output (car item) (cdr item))
+                    (error () nil))
+               (%done transport)))))
+
+(defun %spawn-request (transport output msg)
+  ":CONCURRENT: run the request MSG on a thread of its own."
+  (bt2:with-lock-held ((transport-state-lock transport))
+    (unless (transport-closed-by-user transport)
+      (incf (transport-active transport))
+      (let (thread)
+        ;; The worker removes itself under STATE-LOCK, held here until it is
+        ;; pushed, so it is never removed before it is added.
+        (setf thread
+              (bt2:make-thread
+               (lambda ()
+                 (unwind-protect
+                      (catch '%stop-worker
+                        (handler-case (%handle-incoming transport output :request msg)
+                          (error () nil)))
+                   (%done transport (bt2:current-thread))))
+               :name "stdio-rpc request"))
+        (push thread (transport-workers transport))))))
+
 (defun %route-line (transport output line)
   "Route one line read by the client's reader (see the header)."
   (let ((msg (handler-case (rpc-protocol:decode-message line)
                (error () (return-from %route-line nil)))))  ; junk is dropped
-    (case (%classify msg)
-      (:response (%route-response transport msg))
-      (:notification
-       (let ((handler (stdio-rpc-transport-on-notification transport)))
-         (when handler
-           ;; The header: an error in the handler is dropped, reading goes on.
-           (handler-case (funcall handler (gethash "method" msg) (gethash "params" msg))
-             (error () nil)))))
-      (:request
-       (let ((wire (%answer (or (stdio-rpc-transport-on-request transport)
-                                #'%no-request-handler)
-                            msg)))
-         (when wire
-           ;; A server that went away cannot be answered; the answer is dropped.
-           (handler-case (%write-json-line output wire transport)
-             (stream-error () nil))))))))
+    (let ((kind (%classify msg)))
+      (case kind
+        (:response (%route-response transport msg))
+        ((:notification :request)
+         (ecase (stdio-rpc-transport-dispatch transport)
+           (:reader (%handle-incoming transport output kind msg))
+           (:serial (%enqueue transport kind msg))
+           (:concurrent (if (eq kind :request)
+                            (%spawn-request transport output msg)
+                            (%enqueue transport kind msg)))))))))
 
 (defun %reader-loop (transport input output)
   (catch '%stop-reader                  ; CLOSE-STDIO-RPC-TRANSPORT's last resort
@@ -344,10 +480,37 @@ and every later call signals \"peer closed\"."
   "Start the reader thread on INPUT unless it runs or the transport is closed."
   (bt2:with-lock-held ((transport-state-lock transport))
     (unless (or (transport-reader transport) (transport-closed transport))
+      (unless (eq :reader (stdio-rpc-transport-dispatch transport))
+        (setf (transport-dispatcher transport)
+              (bt2:make-thread (lambda () (%dispatcher-loop transport output))
+                               :name "stdio-rpc dispatcher")))
       (setf (transport-reader transport)
             (bt2:make-thread (lambda () (%reader-loop transport input output))
                              :name "stdio-rpc reader"))))
   transport)
+
+(defun stdio-rpc-transport-wait-closed (transport &key timeout)
+  "See the header (0.3.0). → T once the input is closed and no handler runs,
+NIL when TIMEOUT seconds passed first."
+  (multiple-value-call #'%ensure-reader transport (%ensure-io transport))
+  (let ((lock (transport-state-lock transport))
+        (cv (transport-state-cv transport))
+        (deadline (and timeout
+                       (+ (get-internal-real-time)
+                          (round (* timeout internal-time-units-per-second))))))
+    (bt2:with-lock-held (lock)
+      (loop
+        (when (and (or (transport-closed transport) (transport-closed-by-user transport))
+                   (zerop (transport-active transport))
+                   (or (transport-closed-by-user transport)
+                       (null (transport-queue transport))))
+          (return t))
+        (if deadline
+            (let ((remaining (/ (- deadline (get-internal-real-time))
+                                internal-time-units-per-second)))
+              (when (<= remaining 0) (return nil))
+              (bt2:condition-wait cv lock :timeout remaining))
+            (bt2:condition-wait cv lock))))))
 
 (defun %await (transport cell timeout)
   "Wait, under STATE-LOCK, until CELL is answered, the transport closes, or
@@ -370,6 +533,12 @@ TIMEOUT seconds pass. → :DONE, :CLOSED or :TIMEOUT."
 
 (defmethod rpc-protocol:backend-rpc-call
     ((transport stdio-rpc-transport) method params &key timeout id)
+  (when (eq (bt2:current-thread) (transport-reader transport))
+    ;; Only the reader could read the response: waiting here never ends.
+    (error 'rpc-protocol:rpc-error
+           :message (format nil "~a ~s ~a" "rpc-call" method
+                            "from a handler on the reader thread would deadlock; make the transport with :dispatch :serial or :concurrent")
+           :code rpc-protocol:+internal-error+))
   (multiple-value-bind (in out) (%ensure-io transport)
     (let ((cell (%make-cell))
           (pending (transport-pending transport)))
@@ -467,7 +636,9 @@ it more than a second."
 (defun close-stdio-rpc-transport (transport &key force (timeout 5))
   "See the header (0.2.0: stdin first, TIMEOUT, the reader thread)."
   (when (bt2:with-lock-held ((transport-state-lock transport))
-          (shiftf (transport-closed-by-user transport) t))
+          (prog1 (shiftf (transport-closed-by-user transport) t)
+            ;; The dispatcher stops taking queued messages.
+            (bt2:condition-broadcast (transport-state-cv transport))))
     (return-from close-stdio-rpc-transport transport))
   (let ((process (transport-process transport))
         (input (transport-input transport))
@@ -494,7 +665,27 @@ it more than a second."
           (%join-reader reader 1))))
     (%close-quietly input)
     ;; 4. Waiting calls get "peer closed".
-    (%mark-closed transport))
+    (%mark-closed transport)
+    ;; 5. (0.3.0) The dispatcher and the request workers: their calls now
+    ;;    fail and their answers cannot be written, so they end; one blocked
+    ;;    on something else is unwound after a grace period.
+    (%stop-workers transport))
   transport)
+
+(defun %stop-workers (transport)
+  (flet ((threads ()
+           (bt2:with-lock-held ((transport-state-lock transport))
+             (let ((d (transport-dispatcher transport)))
+               (append (and d (list d)) (copy-list (transport-workers transport)))))))
+    (let ((deadline (+ (get-internal-real-time) (* 2 internal-time-units-per-second))))
+      (loop while (and (some #'bt2:thread-alive-p (threads))
+                       (< (get-internal-real-time) deadline))
+            do (sleep 0.01)))
+    (dolist (thread (threads))
+      (when (bt2:thread-alive-p thread)
+        (handler-case (bt2:interrupt-thread thread (lambda () (throw '%stop-worker nil)))
+          (error () nil))))
+    (dolist (thread (threads))
+      (%join-reader thread 1))))
 
 (use-stdio-rpc-transport)
