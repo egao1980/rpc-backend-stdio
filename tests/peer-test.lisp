@@ -28,24 +28,32 @@ thread is left behind)."
     t))
 
 (defun %serve-lines (handler &rest lines)
-  "RPC-SERVE HANDLER over LINES (string streams). → the decoded output lines."
+  "RPC-SERVE HANDLER over LINES (string streams). → (values the decoded output
+lines, the raw output lines)."
   (let* ((in (make-string-input-stream (format nil "~{~a~%~}" lines)))
          (out (make-string-output-stream))
          (tx (rpc-backend-stdio:make-stdio-rpc-transport :input in :output out)))
     (rpc-protocol:rpc-serve handler :transport tx)
-    (with-input-from-string (s (get-output-stream-string out))
-      (loop for line = (read-line s nil) while line
-            collect (rpc-protocol:decode-message line)))))
+    (let ((raw (with-input-from-string (s (get-output-stream-string out))
+                 (loop for line = (read-line s nil) while line collect line))))
+      (values (mapcar #'rpc-protocol:decode-message raw) raw))))
 
 (defun %nth (n list)
   (and (listp list) (nth n list)))
 
 (defun %null-id-p (message)
-  "MESSAGE has an \"id\" key whose value is JSON null (:NULL or NIL, by the
-json-protocol backend)."
+  "MESSAGE has an \"id\" key whose value is JSON null (:NULL; false decodes
+to NIL and does not count, #17)."
   (and (hash-table-p message)
        (multiple-value-bind (value present) (gethash "id" message)
-         (and present (member value '(:null nil)) t))))
+         (and present (eq value :null)))))
+
+(defun %wire-null-id-p (line)
+  "LINE, a raw output line, has the exact text \"id\":null and no \"id\":false (#17)."
+  (and (stringp line)
+       (search "\"id\":null" line)
+       (not (search "\"id\":false" line))
+       t))
 
 (defun %error-code (message)
   (and (hash-table-p message)
@@ -344,13 +352,14 @@ what is written to PEER-OUT (both pipe ends)."
         (t (error 'rpc-protocol:rpc-method-not-found))))
 
 (deftest serve-parse-error-goes-on
-  (let ((out (handler-case (%serve-lines #'%echo-handler
+  (multiple-value-bind (out raw) (handler-case (%serve-lines #'%echo-handler
                                          "{not json"
                                          (rpc-protocol:encode-request "echo" "after" :id 2))
-               (error (e) (format nil "signalled: ~a" e)))))
+               (error (e) (format nil "signalled: ~a" e)))
     (ok (and (listp out) (= 2 (length out))) (format nil "~s" out))
     (ok (eql rpc-protocol:+parse-error+ (%error-code (%nth 0 out))))
     (ok (%null-id-p (%nth 0 out)) "\"id\": null")
+    (ok (%wire-null-id-p (%nth 0 raw)) (format nil "wire: ~a" (%nth 0 raw)))
     (ok (equal "after" (and (hash-table-p (%nth 1 out)) (gethash "result" (%nth 1 out)))))))
 
 (deftest-parametrize serve-invalid-requests
@@ -362,13 +371,13 @@ what is written to PEER-OUT (both pipe ends)."
      ("{\"method\":\"echo\",\"params\":\"x\",\"id\":9}" 9)
      ("{\"jsonrpc\":\"2.0\",\"id\":6}" 6)
      ("{\"jsonrpc\":\"2.0\",\"method\":7,\"id\":8}" 8))
-  (let ((out (handler-case (%serve-lines #'%echo-handler line
-                                         (rpc-protocol:encode-request "echo" "next" :id 100))
-               (error (e) (format nil "signalled: ~a" e)))))
+  (multiple-value-bind (out raw) (handler-case (%serve-lines #'%echo-handler line
+                                                            (rpc-protocol:encode-request "echo" "next" :id 100))
+                                  (error (e) (format nil "signalled: ~a" e)))
     (ok (and (listp out) (= 2 (length out))) (format nil "~s" out))
     (ok (eql rpc-protocol:+invalid-request+ (%error-code (%nth 0 out))))
     (ok (if (eq id :null)
-            (%null-id-p (%nth 0 out))
+            (and (%null-id-p (%nth 0 out)) (%wire-null-id-p (%nth 0 raw)))
             (equal id (and (hash-table-p (%nth 0 out)) (gethash "id" (%nth 0 out)))))
         "the id")
     (ok (equal "next" (and (hash-table-p (%nth 1 out)) (gethash "result" (%nth 1 out))))
@@ -403,11 +412,12 @@ what is written to PEER-OUT (both pipe ends)."
     (ok (null quiet) "a batch of notifications writes nothing")))
 
 (deftest serve-null-id-and-handler-errors
-  (let ((out (%serve-lines #'%echo-handler
+  (multiple-value-bind (out raw) (%serve-lines #'%echo-handler
                            "{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"params\":\"x\",\"id\":null}"
-                           (rpc-protocol:encode-request "boom" "zap" :id 3))))
+                           (rpc-protocol:encode-request "boom" "zap" :id 3))
     (ok (and (listp out) (= 2 (length out))))
     (ok (%null-id-p (%nth 0 out)))
+    (ok (%wire-null-id-p (%nth 0 raw)) "a request's null id is echoed as null")
     (ok (equal "x" (gethash "result" (%nth 0 out))))
     (ok (eql rpc-protocol:+internal-error+ (%error-code (%nth 1 out))))
     (ok (search "boom zap" (gethash "message" (gethash "error" (%nth 1 out)))))))

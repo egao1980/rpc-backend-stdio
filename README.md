@@ -50,6 +50,15 @@ are done.
   the pipe, `stdio-rpc-pipe-held` (a `warning`) is signalled, the stream is
   closed and close returns.
 
+### 0.3.2
+
+- `-32700` / `-32600` answers carry `"id":null` on the wire (0.3.1 wrote
+  `"id":false`).
+- `stdio-rpc-peer-closed`: the "peer closed" condition, a subclass of
+  `rpc-protocol:rpc-error` with code -32603 (existing handlers still match).
+- `:class` on `make-stdio-rpc-transport` / `make-stdio-rpc-pair`: instantiate a
+  subclass of `stdio-rpc-transport`.
+
 CI: canned [`cl-repository`](https://github.com/egao1980/cl-repository) (`test-system.yml` / `setup-client` + `ci`). Deps from `ghcr.io/egao1980/cl-systems`.
 
 ## License
