@@ -16,4 +16,8 @@
            ;; 0.3.0
            #:stdio-rpc-transport-dispatch
            #:stdio-rpc-transport-wait-closed
-           #:*stdio-rpc-request-id*))
+           #:*stdio-rpc-request-id*
+           ;; 0.3.1
+           #:stdio-rpc-pipe-held
+           #:stdio-rpc-pipe-held-process
+           #:stdio-rpc-pipe-held-seconds))

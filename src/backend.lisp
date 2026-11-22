@@ -59,7 +59,8 @@
 ;;;                  its value is the result, an RPC-ERROR its error, any other
 ;;;                  error -32603; without ON-REQUEST → -32601 "Method not
 ;;;                  found". The answer is written with the write lock.
-;;;   anything else (not JSON, not an object) → dropped
+;;;   anything else (not JSON, not an object) → dropped (0.3.1: answered
+;;;                when the transport has ON-REQUEST, see below)
 ;;; Several threads may call at once; each RPC-CALL writes its request and
 ;;; waits for its own id. Ids are the transport's counter (1, 2, …) unless
 ;;; :ID is given. An error response → RPC-ERROR with its code, message and
@@ -116,6 +117,31 @@
 ;;; if needed and block until the input reached EOF (or the transport was
 ;;; closed) and no handler runs or waits in the queue. → T, or NIL when
 ;;; TIMEOUT seconds passed first. An agent process's main thread waits here.
+;;;
+;;; 0.3.1: peer-mode errors (#14). A transport with ON-REQUEST serves, so its
+;;; reader answers bad lines as the server loop does, at once, on the reader
+;;; thread, under the write lock (whatever :DISPATCH says), and reads on:
+;;;   not JSON                    → -32700 "Parse error", "id": null
+;;;   not an object or an array   → -32600 "Invalid Request", "id": null
+;;;   an invalid envelope         → -32600 with its id (number or string) or null
+;;;   an array                    → each element routed as a line of its own;
+;;;                                 the -32600 answers to its invalid elements
+;;;                                 go out as ONE array line; an empty array →
+;;;                                 one -32600 object. Requests in it are
+;;;                                 answered one by one, not as a batch.
+;;; Error responses carry no "method", so they are :RESPONSEs: two peers never
+;;; answer each other's errors. Without ON-REQUEST bad lines are still
+;;; dropped. Blank lines are ignored. A last line cut short by EOF (no LF) is
+;;; never answered with -32700, by the reader or the server loop.
+;;;
+;;; 0.3.1: bounded close (#12). CLOSE-STDIO-RPC-TRANSPORT … &key (GRACE 3):
+;;; once the child exited (or was killed), the reader gets GRACE seconds to
+;;; reach EOF on the child's stdout. Another process may hold that pipe (a
+;;; grandchild that inherited it); then STDIO-RPC-PIPE-HELD (a WARNING) is
+;;; signalled, the stream is closed on a helper thread (closing a Windows
+;;; pipe under a pending read blocks; that close is waited for 1 s at most),
+;;; the reader is interrupted, and close returns. A reader that still cannot
+;;; be woken is left behind; it ends when the pipe's last writer goes away.
 
 (defclass stdio-rpc-transport (rpc-protocol:rpc-transport)
   ((input :initarg :input :initform nil :accessor transport-input)
@@ -177,6 +203,16 @@ answered or CLOSED becomes true; RPC-CALL waits on it.")
   (:report (lambda (c s)
              (format s "stdio RPC call ~s timed out after ~a s"
                      (stdio-rpc-timeout-method c) (stdio-rpc-timeout-seconds c)))))
+
+(define-condition stdio-rpc-pipe-held (warning)
+  ((process :initarg :process :initform nil :reader stdio-rpc-pipe-held-process)
+   (seconds :initarg :seconds :initform nil :reader stdio-rpc-pipe-held-seconds))
+  (:documentation "CLOSE-STDIO-RPC-TRANSPORT (0.3.1): the child's stdout did not
+reach EOF within GRACE seconds of the child's exit, so another process still
+holds the pipe. The stream was closed without waiting for EOF.")
+  (:report (lambda (c s)
+             (format s "stdio RPC: the child's stdout was still held open ~a s after the child exited (another process holds the pipe); closed without waiting for EOF"
+                     (stdio-rpc-pipe-held-seconds c)))))
 
 (defun %has-handler-p (transport)
   (or (stdio-rpc-transport-on-notification transport)
@@ -311,15 +347,18 @@ for a notification. RPC-ERROR → its code, message and data; any other ERROR
 (defun %blank-line-p (line)
   (every (lambda (c) (member c '(#\Space #\Tab #\Return #\Page))) line))
 
-(defun %serve-line (handler line)
-  "The server's answer to one input LINE: a wire string, or NIL."
+(defun %parse-error ()
+  (rpc-protocol:encode-error-response rpc-protocol:+parse-error+ "Parse error" :id nil))
+
+(defun %serve-line (handler line &optional truncated)
+  "The server's answer to one input LINE: a wire string, or NIL. TRUNCATED:
+the line was cut short by EOF (0.3.1: no -32700 for it)."
   (when (%blank-line-p line)
     (return-from %serve-line nil))
   (let ((msg (handler-case (rpc-protocol:decode-message line)
                (error ()
                  (return-from %serve-line
-                   (rpc-protocol:encode-error-response
-                    rpc-protocol:+parse-error+ "Parse error" :id nil))))))
+                   (and (not truncated) (%parse-error)))))))
     (cond ((hash-table-p msg) (%serve-one handler msg))
           ((and (vectorp msg) (not (stringp msg)))
            (if (zerop (length msg))
@@ -447,20 +486,54 @@ counts as ACTIVE until %DONE."
                :name "stdio-rpc request"))
         (push thread (transport-workers transport))))))
 
-(defun %route-line (transport output line)
-  "Route one line read by the client's reader (see the header)."
-  (let ((msg (handler-case (rpc-protocol:decode-message line)
-               (error () (return-from %route-line nil)))))  ; junk is dropped
-    (let ((kind (%classify msg)))
-      (case kind
-        (:response (%route-response transport msg))
-        ((:notification :request)
-         (ecase (stdio-rpc-transport-dispatch transport)
-           (:reader (%handle-incoming transport output kind msg))
-           (:serial (%enqueue transport kind msg))
-           (:concurrent (if (eq kind :request)
-                            (%spawn-request transport output msg)
-                            (%enqueue transport kind msg)))))))))
+(defun %route-message (transport output msg)
+  "Route one decoded object (or batch element) read by the client's reader.
+→ the -32600 wire answer when MSG is not a valid envelope and the transport
+serves (has ON-REQUEST), else NIL (0.3.1)."
+  (let ((kind (%classify msg)))
+    (ecase kind
+      (:response (%route-response transport msg) nil)
+      (:invalid (and (stdio-rpc-transport-on-request transport)
+                     (%invalid-request msg)))
+      ((:notification :request)
+       (ecase (stdio-rpc-transport-dispatch transport)
+         (:reader (%handle-incoming transport output kind msg))
+         (:serial (%enqueue transport kind msg))
+         (:concurrent (if (eq kind :request)
+                          (%spawn-request transport output msg)
+                          (%enqueue transport kind msg))))
+       nil))))
+
+(defun %route-line (transport output line &optional truncated)
+  "Route one line read by the client's reader (see the header). TRUNCATED:
+the line was cut short by EOF."
+  (when (%blank-line-p line)
+    (return-from %route-line nil))
+  (let* ((serves (stdio-rpc-transport-on-request transport))
+         (wire
+           (let ((msg (handler-case (rpc-protocol:decode-message line)
+                        (error ()
+                          ;; 0.3.1: a peer that serves answers -32700.
+                          (return-from %route-line
+                            (when (and serves (not truncated))
+                              (%write-answer transport output (%parse-error))))))))
+             (cond ((hash-table-p msg) (%route-message transport output msg))
+                   ((and (vectorp msg) (not (stringp msg)))
+                    (if (zerop (length msg))
+                        (and serves (%invalid-request nil))
+                        (let ((answers (remove nil (map 'list (lambda (e) (%route-message transport output e))
+                                                        msg))))
+                          (and answers (format nil "[~{~a~^,~}]" answers)))))
+                   ;; numbers, strings, true / false / null
+                   (t (and serves (%invalid-request nil)))))))
+    (when wire
+      (%write-answer transport output wire))))
+
+(defun %write-answer (transport output wire)
+  "Write WIRE under the write lock. A peer that went away cannot be answered;
+the answer is dropped."
+  (handler-case (%write-json-line output wire transport)
+    (error () nil)))
 
 (defun %reader-loop (transport input output)
   (catch '%stop-reader                  ; CLOSE-STDIO-RPC-TRANSPORT's last resort
@@ -469,10 +542,11 @@ counts as ACTIVE until %DONE."
          ;; error) is the peer closing: nothing escapes the thread function,
          ;; so the reader never reaches the debugger.
          (handler-case
-             (loop for line = (read-line input nil :eof)
-                   until (eq line :eof)
-                   do (handler-case (%route-line transport output line)
-                        (error () nil)))
+             (loop
+               (multiple-value-bind (line truncated) (read-line input nil :eof)
+                 (when (eq line :eof) (return))
+                 (handler-case (%route-line transport output line truncated)
+                   (error () nil))))
            (error () nil))
       (%mark-closed transport))))
 
@@ -580,11 +654,12 @@ TIMEOUT seconds pass. → :DONE, :CLOSED or :TIMEOUT."
            :message "the transport is a client (its reader thread runs)"
            :code rpc-protocol:+internal-error+))
   (multiple-value-bind (in out) (%ensure-io transport)
-    (loop for line = (read-line in nil :eof)
-          until (eq line :eof)
-          do (let ((wire (%serve-line handler line)))
-               (when wire
-                 (%write-json-line out wire transport)))))
+    (loop
+      (multiple-value-bind (line truncated) (read-line in nil :eof)
+        (when (eq line :eof) (return))
+        (let ((wire (%serve-line handler line truncated)))
+          (when wire
+            (%write-json-line out wire transport))))))
   transport)
 
 ;;; Close.
@@ -633,8 +708,19 @@ it more than a second."
       (handler-case (bt2:join-thread thread) (error () nil))
       t)))
 
-(defun close-stdio-rpc-transport (transport &key force (timeout 5))
-  "See the header (0.2.0: stdin first, TIMEOUT, the reader thread)."
+(defun %close-bounded (stream seconds)
+  "Close STREAM on a helper thread and wait for it up to SECONDS. → T when it
+was closed in time. On Windows, closing a pipe while another thread's read is
+pending blocks until that read ends (rpc-backend-stdio#10, #12)."
+  (or (null stream)
+      (%join-reader (bt2:make-thread (lambda () (%close-quietly stream))
+                                     :name "stdio-rpc close")
+                    seconds)))
+
+(defun close-stdio-rpc-transport (transport &key force (timeout 5) (grace 3))
+  "See the header (0.2.0: stdin first, TIMEOUT, the reader thread; 0.3.1:
+GRACE seconds for EOF on the child's stdout once it exited)."
+  (check-type grace (real 0))
   (when (bt2:with-lock-held ((transport-state-lock transport))
           (prog1 (shiftf (transport-closed-by-user transport) t)
             ;; The dispatcher stops taking queued messages.
@@ -651,19 +737,29 @@ it more than a second."
     ;; 3. The reader. An in-memory pipe wakes its reader on close; a child's
     ;;    stdout reaches EOF when it exits. Other streams are closed after a
     ;;    short wait, which ends a blocked read with an error (caught there).
-    (when (%close-wakes-reader-p input)
-      (%close-quietly input))
-    (when reader
-      (unless (%join-reader reader (if process 5 0.5))
+    ;;    0.3.1: every wait is bounded; another process may hold the child's
+    ;;    stdout, so EOF may never come (#12).
+    (let ((input-closed nil))
+      (when (%close-wakes-reader-p input)
         (%close-quietly input)
-        (unless (%join-reader reader 2)
-          ;; Last resort: a read that close cannot wake (a foreign stream).
-          ;; The reader unwinds to its CATCH, marking the transport closed.
-          (handler-case
-              (bt2:interrupt-thread reader (lambda () (throw '%stop-reader nil)))
-            (error () nil))
-          (%join-reader reader 1))))
-    (%close-quietly input)
+        (setf input-closed t))
+      (when reader
+        (unless (%join-reader reader (if process grace 0.5))
+          (when process
+            (warn 'stdio-rpc-pipe-held :process process :seconds grace))
+          ;; Tried once: a close still blocked on its helper thread is not
+          ;; tried again below.
+          (%close-bounded input 1)
+          (setf input-closed t)
+          (unless (%join-reader reader 1)
+            ;; Last resort: a read that close cannot wake (a foreign stream).
+            ;; The reader unwinds to its CATCH, marking the transport closed.
+            (handler-case
+                (bt2:interrupt-thread reader (lambda () (throw '%stop-reader nil)))
+              (error () nil))
+            (%join-reader reader 1))))
+      (unless input-closed
+        (%close-bounded input 1)))
     ;; 4. Waiting calls get "peer closed".
     (%mark-closed transport)
     ;; 5. (0.3.0) The dispatcher and the request workers: their calls now
