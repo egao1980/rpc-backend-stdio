@@ -64,3 +64,15 @@ CI: canned [`cl-repository`](https://github.com/egao1980/cl-repository) (`test-s
 ## License
 
 MIT
+
+### The child's environment and directory (0.4.0)
+
+`:command` children take `:env` (entries `(name . value)` or `"NAME=VALUE"`),
+`:env-mode` (`:merge`, the default: over the inherited environment, a NIL value
+unsets; `:replace`: exactly `:env`) and `:directory`, passed to
+`process-protocol:launch`.
+
+```lisp
+(make-stdio-rpc-transport :command '("my-server") :env '(("TOKEN" . "x"))
+                          :directory #p"/srv/project/" :error-output log-path)
+```
