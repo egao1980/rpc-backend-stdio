@@ -19,10 +19,10 @@
 ;;;   time. OPEN-STREAM-P follows CLOSE. INPUT-STREAM-P / OUTPUT-STREAM-P are
 ;;;   true for INPUT / OUTPUT only. STREAM-ELEMENT-TYPE is CHARACTER.
 ;;;
-;;; MAKE-STDIO-RPC-PAIR &key ON-NOTIFICATION ON-REQUEST
+;;; MAKE-STDIO-RPC-PAIR &key ON-NOTIFICATION ON-REQUEST DISPATCH (0.3.0)
 ;;;   → (values server client): two STDIO-RPC-TRANSPORTs over two pipes,
 ;;;   the server reading what the client writes and the client reading what
-;;;   the server writes. ON-NOTIFICATION / ON-REQUEST go to the CLIENT (its
+;;;   the server writes. ON-NOTIFICATION / ON-REQUEST / DISPATCH go to the CLIENT (its
 ;;;   reader starts at once when one is given). Run RPC-SERVE on SERVER in a
 ;;;   thread of its own. CLOSE-STDIO-RPC-TRANSPORT on the client closes the
 ;;;   pipe the server reads, so the server's RPC-SERVE returns (EOF); on the
@@ -201,11 +201,12 @@ never interleaved with another writer's, even while it waits for space."
     (values (make-instance '%pipe-input :pipe pipe)
             (make-instance '%pipe-output :pipe pipe))))
 
-(defun make-stdio-rpc-pair (&key on-notification on-request)
+(defun make-stdio-rpc-pair (&key on-notification on-request (dispatch :reader))
   "→ (values server client) over two in-memory pipes (see the header)."
   (multiple-value-bind (server-in client-out) (make-stdio-pipe)
     (multiple-value-bind (client-in server-out) (make-stdio-pipe)
       (values (make-stdio-rpc-transport :input server-in :output server-out)
               (make-stdio-rpc-transport :input client-in :output client-out
                                         :on-notification on-notification
-                                        :on-request on-request)))))
+                                        :on-request on-request
+                                        :dispatch dispatch)))))

@@ -12,4 +12,8 @@
            #:stdio-rpc-timeout-method
            #:stdio-rpc-timeout-seconds
            #:make-stdio-pipe
-           #:make-stdio-rpc-pair))
+           #:make-stdio-rpc-pair
+           ;; 0.3.0
+           #:stdio-rpc-transport-dispatch
+           #:stdio-rpc-transport-wait-closed
+           #:*stdio-rpc-request-id*))
