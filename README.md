@@ -39,6 +39,17 @@ are done.
                           :dispatch :concurrent)
 ```
 
+### 0.3.1
+
+- A transport with `:on-request` answers lines it cannot use as the server
+  loop does: not JSON → -32700 `Parse error` (`"id": null`), not a valid
+  envelope → -32600 `Invalid Request`, and reads on. Without `:on-request`
+  they are dropped. A last line cut short by EOF is never answered.
+- `close-stdio-rpc-transport … :grace 3`: once the child exited, EOF on its
+  stdout is waited for `grace` seconds at most. If another process still holds
+  the pipe, `stdio-rpc-pipe-held` (a `warning`) is signalled, the stream is
+  closed and close returns.
+
 CI: canned [`cl-repository`](https://github.com/egao1980/cl-repository) (`test-system.yml` / `setup-client` + `ci`). Deps from `ghcr.io/egao1980/cl-systems`.
 
 ## License
