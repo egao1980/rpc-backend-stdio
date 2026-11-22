@@ -148,6 +148,14 @@
 ;;; same message, so RPC-ERROR handlers still match (#16). MAKE-STDIO-RPC-TRANSPORT
 ;;; and MAKE-STDIO-RPC-PAIR take :CLASS, a subclass of STDIO-RPC-TRANSPORT to
 ;;; instantiate (#16).
+;;;
+;;; 0.4.0: the :COMMAND child's environment and directory. MAKE-STDIO-RPC-TRANSPORT
+;;; takes :ENV, :ENV-MODE (default :MERGE) and :DIRECTORY, passed as they are to
+;;; PROCESS-PROTOCOL:LAUNCH (ENV entries are (name . value) or "NAME=VALUE"; with
+;;; :MERGE they go over the inherited environment and a NIL value unsets; with
+;;; :REPLACE the child gets exactly ENV). NIL (the default) leaves the child the
+;;; parent's environment and working directory, as before. They mean nothing
+;;; without :COMMAND (egao1980/mcp-backend-stdio#7).
 
 (defclass stdio-rpc-transport (rpc-protocol:rpc-transport)
   ((input :initarg :input :initform nil :accessor transport-input)
@@ -167,6 +175,13 @@ another thread never interleaves with a response.")
                :documentation "Client: (lambda (method params)) → result, for requests the server sends.")
    (error-output :initarg :error-output :initform :interactive :reader transport-error-output
                  :documentation ":COMMAND: the child's stderr (PROCESS-PROTOCOL:LAUNCH :ERROR-OUTPUT).")
+   ;; 0.4.0
+   (env :initarg :env :initform nil :reader transport-env
+        :documentation ":COMMAND: PROCESS-PROTOCOL:LAUNCH :ENV, or NIL.")
+   (env-mode :initarg :env-mode :initform :merge :reader transport-env-mode
+             :documentation ":COMMAND: PROCESS-PROTOCOL:LAUNCH :ENV-MODE (:MERGE or :REPLACE).")
+   (directory :initarg :directory :initform nil :reader transport-directory
+              :documentation ":COMMAND: the child's working directory, or NIL (the parent's).")
    (reader :initform nil :accessor transport-reader
            :documentation "The client's reader thread, or NIL.")
    (pending :initform (make-hash-table :test 'equal) :reader transport-pending
@@ -236,6 +251,7 @@ holds the pipe. The stream was closed without waiting for EOF.")
        (subtypep class 'stdio-rpc-transport)))
 
 (defun make-stdio-rpc-transport (&key input output command (error-output :interactive)
+                                      env (env-mode :merge) directory
                                       on-notification on-request (dispatch :reader)
                                       (class 'stdio-rpc-transport))
   "A transport on INPUT / OUTPUT (default *STANDARD-INPUT* / *STANDARD-OUTPUT*
@@ -243,12 +259,15 @@ when used), or on the pipes of COMMAND launched on first use. ON-NOTIFICATION
 or ON-REQUEST make it a client whose reader thread starts at once. DISPATCH
 (0.3.0): :READER, :SERIAL or :CONCURRENT, the thread the handlers run on
 (see the header). CLASS (0.3.2, #16): the class to instantiate, STDIO-RPC-TRANSPORT
-or a subclass of it."
+or a subclass of it. ENV, ENV-MODE and DIRECTORY (0.4.0): the :COMMAND child's
+environment and working directory, as PROCESS-PROTOCOL:LAUNCH takes them."
   (check-type dispatch (member :reader :serial :concurrent))
+  (check-type env-mode (member :merge :replace))
   (check-type class (satisfies %transport-class-p) "STDIO-RPC-TRANSPORT or a subclass (a name or a class)")
   (let ((transport (make-instance class
                                   :input input :output output :command command
                                   :error-output error-output :dispatch dispatch
+                                  :env env :env-mode env-mode :directory directory
                                   :on-notification on-notification :on-request on-request)))
     ;; With :COMMAND the child is launched on first use, and the reader
     ;; starts right after the launch (%ENSURE-IO).
@@ -284,8 +303,13 @@ CLOSE-STDIO-RPC-TRANSPORT never closes them."
       (error 'rpc-protocol:rpc-error
              :message "*process-backend* is nil — load process-backend-uiop"
              :code rpc-protocol:+internal-error+))
-    (let ((handle (process-protocol:launch (transport-command transport)
-                                           :error-output (transport-error-output transport))))
+    (let ((handle (apply #'process-protocol:launch (transport-command transport)
+                         :error-output (transport-error-output transport)
+                         (append (when (transport-env transport)
+                                   (list :env (transport-env transport)
+                                         :env-mode (transport-env-mode transport)))
+                                 (when (transport-directory transport)
+                                   (list :directory (transport-directory transport)))))))
       (setf (transport-process transport) handle
             (transport-input transport) (process-protocol:stdout handle)
             (transport-output transport) (process-protocol:stdin handle))
