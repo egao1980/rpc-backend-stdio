@@ -18,15 +18,18 @@
       message))
 
 (defun %ask-raw (peer-in peer-out line)
+  "Send LINE, read one answer line. → (values the decoded answer, the raw line)."
   (%peer-send peer-out line)
-  (rpc-protocol:decode-message (read-line peer-in)))
+  (let ((answer (read-line peer-in)))
+    (values (rpc-protocol:decode-message answer) answer)))
 
 (deftest-parametrize peer-answers-bad-lines
     ((dispatch) :ids ("reader" "serial" "concurrent") (:reader) (:serial) (:concurrent))
   (with-raw-peer (client peer-in peer-out :dispatch dispatch :on-request #'%peer-handler)
-    (let ((r (%ask-raw peer-in peer-out "{not json")))
+    (multiple-value-bind (r wire) (%ask-raw peer-in peer-out "{not json")
       (ok (eql rpc-protocol:+parse-error+ (%error-code r)) "not JSON → -32700")
-      (ok (%null-id-p r) "\"id\": null"))
+      (ok (%null-id-p r) "\"id\": null")
+      (ok (%wire-null-id-p wire) (format nil "wire: ~a" wire)))
     (ok (equal "after" (gethash "result" (%ask-raw peer-in peer-out
                                                    (rpc-protocol:encode-request "echo" "after" :id 1))))
         "the connection keeps working after a parse error")
@@ -37,10 +40,13 @@
                              ("{\"method\":\"echo\",\"id\":9}" 9)
                              ("{\"jsonrpc\":\"2.0\",\"id\":6}" 6)
                              ("{\"jsonrpc\":\"2.0\",\"method\":7,\"id\":\"s8\"}" "s8"))
-          do (let ((r (%first-answer (%ask-raw peer-in peer-out line))))
-               (ok (eql rpc-protocol:+invalid-request+ (%error-code r)) (format nil "~a → -32600" line))
-               (ok (if (eq id :null) (%null-id-p r) (equal id (gethash "id" r)))
-                   (format nil "~a: the id" line))))
+          do (multiple-value-bind (answer wire) (%ask-raw peer-in peer-out line)
+               (let ((r (%first-answer answer)))
+                 (ok (eql rpc-protocol:+invalid-request+ (%error-code r)) (format nil "~a → -32600" line))
+                 (ok (if (eq id :null)
+                         (and (%null-id-p r) (%wire-null-id-p wire))
+                         (equal id (gethash "id" r)))
+                     (format nil "~a: the id" line)))))
     (ok (equal "still" (gethash "result" (%ask-raw peer-in peer-out
                                                    (rpc-protocol:encode-request "echo" "still" :id 2))))
         "and after invalid requests")))
@@ -81,9 +87,10 @@
                                       :name "errors-serve")))
         (unwind-protect
              (progn
-               (let ((r (%ask-raw peer-in peer-out "{not json")))
+               (multiple-value-bind (r wire) (%ask-raw peer-in peer-out "{not json")
                  (ok (eql rpc-protocol:+parse-error+ (%error-code r)))
-                 (ok (%null-id-p r)))
+                 (ok (%null-id-p r))
+                 (ok (%wire-null-id-p wire) (format nil "wire: ~a" wire)))
                (let ((r (%ask-raw peer-in peer-out "{\"method\":\"echo\",\"id\":4}")))
                  (ok (eql rpc-protocol:+invalid-request+ (%error-code r)))
                  (ok (eql 4 (gethash "id" r))))

@@ -142,6 +142,12 @@
 ;;; pipe under a pending read blocks; that close is waited for 1 s at most),
 ;;; the reader is interrupted, and close returns. A reader that still cannot
 ;;; be woken is left behind; it ends when the pipe's last writer goes away.
+;;;
+;;; 0.3.2: every "id": null above is written as JSON null (:NULL), not false
+;;; (#17). "peer closed" is STDIO-RPC-PEER-CLOSED, an RPC-ERROR -32603 with the
+;;; same message, so RPC-ERROR handlers still match (#16). MAKE-STDIO-RPC-TRANSPORT
+;;; and MAKE-STDIO-RPC-PAIR take :CLASS, a subclass of STDIO-RPC-TRANSPORT to
+;;; instantiate (#16).
 
 (defclass stdio-rpc-transport (rpc-protocol:rpc-transport)
   ((input :initarg :input :initform nil :accessor transport-input)
@@ -204,6 +210,13 @@ answered or CLOSED becomes true; RPC-CALL waits on it.")
              (format s "stdio RPC call ~s timed out after ~a s"
                      (stdio-rpc-timeout-method c) (stdio-rpc-timeout-seconds c)))))
 
+(define-condition stdio-rpc-peer-closed (rpc-protocol:rpc-error) ()
+  (:default-initargs :code rpc-protocol:+internal-error+)
+  (:documentation "0.3.2 (#16): the peer closed (EOF or a failed read / write on the
+streams) or the transport was closed, so an RPC-CALL cannot be answered. An
+RPC-ERROR with code -32603 and the message \"stdio RPC peer closed …\", as
+before, so handlers for RPC-ERROR still match."))
+
 (define-condition stdio-rpc-pipe-held (warning)
   ((process :initarg :process :initform nil :reader stdio-rpc-pipe-held-process)
    (seconds :initarg :seconds :initform nil :reader stdio-rpc-pipe-held-seconds))
@@ -218,15 +231,22 @@ holds the pipe. The stream was closed without waiting for EOF.")
   (or (stdio-rpc-transport-on-notification transport)
       (stdio-rpc-transport-on-request transport)))
 
+(defun %transport-class-p (class)
+  (and (or (symbolp class) (typep class 'class))
+       (subtypep class 'stdio-rpc-transport)))
+
 (defun make-stdio-rpc-transport (&key input output command (error-output :interactive)
-                                      on-notification on-request (dispatch :reader))
+                                      on-notification on-request (dispatch :reader)
+                                      (class 'stdio-rpc-transport))
   "A transport on INPUT / OUTPUT (default *STANDARD-INPUT* / *STANDARD-OUTPUT*
 when used), or on the pipes of COMMAND launched on first use. ON-NOTIFICATION
 or ON-REQUEST make it a client whose reader thread starts at once. DISPATCH
 (0.3.0): :READER, :SERIAL or :CONCURRENT, the thread the handlers run on
-(see the header)."
+(see the header). CLASS (0.3.2, #16): the class to instantiate, STDIO-RPC-TRANSPORT
+or a subclass of it."
   (check-type dispatch (member :reader :serial :concurrent))
-  (let ((transport (make-instance 'stdio-rpc-transport
+  (check-type class (satisfies %transport-class-p) "STDIO-RPC-TRANSPORT or a subclass (a name or a class)")
+  (let ((transport (make-instance class
                                   :input input :output output :command command
                                   :error-output error-output :dispatch dispatch
                                   :on-notification on-notification :on-request on-request)))
@@ -243,7 +263,7 @@ or ON-REQUEST make it a client whose reader thread starts at once. DISPATCH
 ;;; Conditions signalled by the client.
 
 (defun %peer-closed (&optional detail)
-  (error 'rpc-protocol:rpc-error
+  (error 'stdio-rpc-peer-closed
          :message (format nil "stdio RPC peer closed~@[ (~a)~]" detail)
          :code rpc-protocol:+internal-error+))
 
@@ -312,11 +332,12 @@ A response is checked before the envelope: it has no \"method\"."
         (t :notification)))
 
 (defun %invalid-request (msg)
-  "The -32600 wire answer for MSG: its id when that is a number or a string."
+  "The -32600 wire answer for MSG: its id when that is a number or a string,
+else JSON null (:NULL; NIL would encode as false, #17)."
   (let ((id (and (hash-table-p msg) (gethash "id" msg))))
     (rpc-protocol:encode-error-response
      rpc-protocol:+invalid-request+ "Invalid Request"
-     :id (and (or (realp id) (stringp id)) id))))
+     :id (if (or (realp id) (stringp id)) id :null))))
 
 (defun %answer (handler msg)
   "Call HANDLER on the request or notification MSG. → the wire answer, or NIL
@@ -348,7 +369,7 @@ for a notification. RPC-ERROR → its code, message and data; any other ERROR
   (every (lambda (c) (member c '(#\Space #\Tab #\Return #\Page))) line))
 
 (defun %parse-error ()
-  (rpc-protocol:encode-error-response rpc-protocol:+parse-error+ "Parse error" :id nil))
+  (rpc-protocol:encode-error-response rpc-protocol:+parse-error+ "Parse error" :id :null))
 
 (defun %serve-line (handler line &optional truncated)
   "The server's answer to one input LINE: a wire string, or NIL. TRUNCATED:

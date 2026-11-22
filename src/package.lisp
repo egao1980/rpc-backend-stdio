@@ -20,4 +20,6 @@
            ;; 0.3.1
            #:stdio-rpc-pipe-held
            #:stdio-rpc-pipe-held-process
-           #:stdio-rpc-pipe-held-seconds))
+           #:stdio-rpc-pipe-held-seconds
+           ;; 0.3.2
+           #:stdio-rpc-peer-closed))
