@@ -156,6 +156,20 @@
 ;;; :REPLACE the child gets exactly ENV). NIL (the default) leaves the child the
 ;;; parent's environment and working directory, as before. They mean nothing
 ;;; without :COMMAND (egao1980/mcp-backend-stdio#7).
+;;;
+;;; 0.4.1: barrier requests (egao1980/cl-stack-code#45). MAKE-STDIO-RPC-TRANSPORT
+;;; takes :BARRIER-METHODS, a list of method names (strings; default NIL). Under
+;;; :CONCURRENT an incoming request whose "method" is one of them is a barrier:
+;;; the requests and notifications read after it are held, not dispatched,
+;;; until its handler returned and its answer was written; then they are
+;;; dispatched as usual, in arrival order (a held barrier holds the ones after
+;;; it again). Responses are still routed as they arrive, so the barrier's
+;;; handler may call the peer and wait. A peer that pipelines a handshake
+;;; request ("initialize") with the requests that need it gets them handled
+;;; after it, and its answer first. :SERIAL and :READER handle one message at
+;;; a time in arrival order already: there the option changes nothing. Held
+;;; messages count as queued: WAIT-CLOSED waits for them, CLOSE-STDIO-RPC-
+;;; TRANSPORT drops them. STDIO-RPC-TRANSPORT-BARRIER-METHODS reads the list.
 
 (defclass stdio-rpc-transport (rpc-protocol:rpc-transport)
   ((input :initarg :input :initform nil :accessor transport-input)
@@ -207,7 +221,15 @@ answered or CLOSED becomes true; RPC-CALL waits on it.")
    (workers :initform '() :accessor transport-workers
             :documentation ":CONCURRENT: the request threads still running.")
    (active :initform 0 :accessor transport-active
-           :documentation "Handlers running off the reader thread now.")))
+           :documentation "Handlers running off the reader thread now.")
+   ;; 0.4.1 (BARRIER-ACTIVE and HELD under STATE-LOCK)
+   (barrier-methods :initarg :barrier-methods :initform nil
+                    :reader stdio-rpc-transport-barrier-methods
+                    :documentation "Method names whose requests are barriers (:CONCURRENT, see the header).")
+   (barrier-active :initform nil :accessor transport-barrier-active
+                   :documentation "True from a barrier request's dispatch until its answer was written.")
+   (held :initform nil :accessor transport-held
+         :documentation "(kind . message) pairs read while a barrier ran, oldest first.")))
 
 (defvar *stdio-rpc-request-id* nil
   "The id of the request whose handler runs in this thread, NIL otherwise.")
@@ -253,21 +275,27 @@ holds the pipe. The stream was closed without waiting for EOF.")
 (defun make-stdio-rpc-transport (&key input output command (error-output :interactive)
                                       env (env-mode :merge) directory
                                       on-notification on-request (dispatch :reader)
-                                      (class 'stdio-rpc-transport))
+                                      barrier-methods (class 'stdio-rpc-transport))
   "A transport on INPUT / OUTPUT (default *STANDARD-INPUT* / *STANDARD-OUTPUT*
 when used), or on the pipes of COMMAND launched on first use. ON-NOTIFICATION
 or ON-REQUEST make it a client whose reader thread starts at once. DISPATCH
 (0.3.0): :READER, :SERIAL or :CONCURRENT, the thread the handlers run on
 (see the header). CLASS (0.3.2, #16): the class to instantiate, STDIO-RPC-TRANSPORT
 or a subclass of it. ENV, ENV-MODE and DIRECTORY (0.4.0): the :COMMAND child's
-environment and working directory, as PROCESS-PROTOCOL:LAUNCH takes them."
+environment and working directory, as PROCESS-PROTOCOL:LAUNCH takes them.
+BARRIER-METHODS (0.4.1): method names whose requests are barriers under
+:CONCURRENT (see the header)."
   (check-type dispatch (member :reader :serial :concurrent))
   (check-type env-mode (member :merge :replace))
   (check-type class (satisfies %transport-class-p) "STDIO-RPC-TRANSPORT or a subclass (a name or a class)")
+  (check-type barrier-methods list)
+  (assert (every #'stringp barrier-methods) (barrier-methods)
+          "BARRIER-METHODS must be a list of method name strings, not ~s" barrier-methods)
   (let ((transport (make-instance class
                                   :input input :output output :command command
                                   :error-output error-output :dispatch dispatch
                                   :env env :env-mode env-mode :directory directory
+                                  :barrier-methods (copy-list barrier-methods)
                                   :on-notification on-notification :on-request on-request)))
     ;; With :COMMAND the child is launched on first use, and the reader
     ;; starts right after the launch (%ENSURE-IO).
@@ -465,16 +493,20 @@ the calling thread, and write a request's answer."
 
 ;;; 0.3.0: dispatch off the reader thread.
 
+(defun %enqueue-locked (transport kind msg)
+  "Queue MSG for the dispatcher thread; STATE-LOCK is held."
+  (unless (transport-closed-by-user transport)
+    (let ((cell (list (cons kind msg))))
+      (if (transport-queue transport)
+          (setf (cdr (transport-queue-tail transport)) cell)
+          (setf (transport-queue transport) cell))
+      (setf (transport-queue-tail transport) cell))
+    (bt2:condition-broadcast (transport-state-cv transport))))
+
 (defun %enqueue (transport kind msg)
   "Queue MSG for the dispatcher thread (under STATE-LOCK)."
   (bt2:with-lock-held ((transport-state-lock transport))
-    (unless (transport-closed-by-user transport)
-      (let ((cell (list (cons kind msg))))
-        (if (transport-queue transport)
-            (setf (cdr (transport-queue-tail transport)) cell)
-            (setf (transport-queue transport) cell))
-        (setf (transport-queue-tail transport) cell))
-      (bt2:condition-broadcast (transport-state-cv transport)))))
+    (%enqueue-locked transport kind msg)))
 
 (defun %take (transport)
   "Wait for the next queued (kind . message). → it, or NIL when the
@@ -512,24 +544,64 @@ counts as ACTIVE until %DONE."
                     (error () nil))
                (%done transport)))))
 
-(defun %spawn-request (transport output msg)
-  ":CONCURRENT: run the request MSG on a thread of its own."
+(defun %spawn-request-locked (transport output msg &optional barrier)
+  ":CONCURRENT, STATE-LOCK held: run the request MSG on a thread of its own.
+BARRIER (0.4.1): MSG is a barrier request; the messages read from now on are
+held until its answer was written, then its worker releases them."
+  (unless (transport-closed-by-user transport)
+    (incf (transport-active transport))
+    (when barrier
+      (setf (transport-barrier-active transport) t))
+    (let (thread)
+      ;; The worker removes itself under STATE-LOCK, held here until it is
+      ;; pushed, so it is never removed before it is added.
+      (setf thread
+            (bt2:make-thread
+             (lambda ()
+               (unwind-protect
+                    (catch '%stop-worker
+                      (handler-case (%handle-incoming transport output :request msg)
+                        (error () nil)))
+                 ;; The answer is written (or could not be): what came after
+                 ;; the barrier goes now, before this worker counts as done.
+                 (when barrier
+                   (%release-held transport output))
+                 (%done transport (bt2:current-thread))))
+             :name "stdio-rpc request"))
+      (push thread (transport-workers transport)))))
+
+;;; 0.4.1: barriers (:CONCURRENT, see the header).
+
+(defun %barrier-request-p (transport kind msg)
+  (and (eq kind :request)
+       (stdio-rpc-transport-barrier-methods transport)
+       (member (gethash "method" msg) (stdio-rpc-transport-barrier-methods transport)
+               :test #'equal)
+       t))
+
+(defun %dispatch-concurrent-locked (transport output kind msg)
+  ":CONCURRENT, STATE-LOCK held: the request MSG to a thread of its own, the
+notification MSG to the dispatcher, or MSG held behind the barrier that runs."
+  (cond ((transport-closed-by-user transport) nil)
+        ((transport-barrier-active transport)
+         (setf (transport-held transport)
+               (nconc (transport-held transport) (list (cons kind msg)))))
+        ((eq kind :request)
+         (%spawn-request-locked transport output msg (%barrier-request-p transport kind msg)))
+        (t (%enqueue-locked transport kind msg))))
+
+(defun %release-held (transport output)
+  "A barrier's answer is out: dispatch the messages held behind it, oldest
+first, until one of them is a barrier again (it holds the rest)."
   (bt2:with-lock-held ((transport-state-lock transport))
-    (unless (transport-closed-by-user transport)
-      (incf (transport-active transport))
-      (let (thread)
-        ;; The worker removes itself under STATE-LOCK, held here until it is
-        ;; pushed, so it is never removed before it is added.
-        (setf thread
-              (bt2:make-thread
-               (lambda ()
-                 (unwind-protect
-                      (catch '%stop-worker
-                        (handler-case (%handle-incoming transport output :request msg)
-                          (error () nil)))
-                   (%done transport (bt2:current-thread))))
-               :name "stdio-rpc request"))
-        (push thread (transport-workers transport))))))
+    (setf (transport-barrier-active transport) nil)
+    (if (transport-closed-by-user transport)
+        (setf (transport-held transport) nil)
+        (loop while (and (transport-held transport)
+                         (not (transport-barrier-active transport)))
+              do (destructuring-bind (kind . msg) (pop (transport-held transport))
+                   (%dispatch-concurrent-locked transport output kind msg))))
+    (bt2:condition-broadcast (transport-state-cv transport))))
 
 (defun %route-message (transport output msg)
   "Route one decoded object (or batch element) read by the client's reader.
@@ -544,9 +616,8 @@ serves (has ON-REQUEST), else NIL (0.3.1)."
        (ecase (stdio-rpc-transport-dispatch transport)
          (:reader (%handle-incoming transport output kind msg))
          (:serial (%enqueue transport kind msg))
-         (:concurrent (if (eq kind :request)
-                          (%spawn-request transport output msg)
-                          (%enqueue transport kind msg))))
+         (:concurrent (bt2:with-lock-held ((transport-state-lock transport))
+                        (%dispatch-concurrent-locked transport output kind msg))))
        nil))))
 
 (defun %route-line (transport output line &optional truncated)
@@ -622,7 +693,9 @@ NIL when TIMEOUT seconds passed first."
         (when (and (or (transport-closed transport) (transport-closed-by-user transport))
                    (zerop (transport-active transport))
                    (or (transport-closed-by-user transport)
-                       (null (transport-queue transport))))
+                       (and (null (transport-queue transport))
+                            ;; 0.4.1: held behind a barrier
+                            (null (transport-held transport)))))
           (return t))
         (if deadline
             (let ((remaining (/ (- deadline (get-internal-real-time))
