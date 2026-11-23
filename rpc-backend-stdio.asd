@@ -1,6 +1,6 @@
 (defsystem "rpc-backend-stdio"
-  :version "0.4.0"
-  :description "stdio (newline JSON-RPC) transport for rpc-protocol: a server loop that answers parse and request errors, a client that demultiplexes responses, notifications and server requests on a reader thread, request handlers dispatched off the reader (:dispatch :serial / :concurrent) so they can call the peer back, peer-mode parse / envelope error answers, a bounded close, the :command child's environment and working directory, and in-memory pipe pairs for tests"
+  :version "0.4.1"
+  :description "stdio (newline JSON-RPC) transport for rpc-protocol: a server loop that answers parse and request errors, a client that demultiplexes responses, notifications and server requests on a reader thread, request handlers dispatched off the reader (:dispatch :serial / :concurrent) so they can call the peer back, peer-mode parse / envelope error answers, a bounded close, the :command child's environment and working directory, barrier requests (:barrier-methods: what a peer pipelines after an initialize waits for its answer), and in-memory pipe pairs for tests"
   :author "egao1980"
   :license "MIT"
   :depends-on ("rpc-protocol" "rpc-protocol-json" "process-protocol" "bordeaux-threads"
@@ -28,7 +28,9 @@
                ;; 0.3.2
                (:file "extension-test")
                ;; 0.4.0
-               (:file "command-env-test"))
+               (:file "command-env-test")
+               ;; 0.4.1
+               (:file "barrier-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

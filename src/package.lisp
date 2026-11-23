@@ -22,4 +22,6 @@
            #:stdio-rpc-pipe-held-process
            #:stdio-rpc-pipe-held-seconds
            ;; 0.3.2
-           #:stdio-rpc-peer-closed))
+           #:stdio-rpc-peer-closed
+           ;; 0.4.1
+           #:stdio-rpc-transport-barrier-methods))

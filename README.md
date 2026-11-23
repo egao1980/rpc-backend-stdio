@@ -76,3 +76,18 @@ unsets; `:replace`: exactly `:env`) and `:directory`, passed to
 (make-stdio-rpc-transport :command '("my-server") :env '(("TOKEN" . "x"))
                           :directory #p"/srv/project/" :error-output log-path)
 ```
+
+### Barrier requests (0.4.1)
+
+Under `:dispatch :concurrent` every request runs on a thread of its own, so a
+request a peer pipelines after `initialize` (without waiting for its answer)
+could run before `initialize` was handled. `:barrier-methods` names the
+requests that must finish first: the requests and notifications read after
+one of them are held until its answer has been written, then dispatched in
+arrival order. Responses are routed as they arrive, so the barrier's handler
+may still call the peer. `:serial` and `:reader` are in order already.
+
+```lisp
+(make-stdio-rpc-transport :input in :output out :dispatch :concurrent
+                          :on-request #'handle :barrier-methods '("initialize"))
+```
